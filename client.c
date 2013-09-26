@@ -25,18 +25,18 @@ static volatile int STOP=FALSE;
 
 static int client_sockfd, client_serfd;
 static struct termios client_oldtio;
+static char client_sername[128];
 
 static int init_serial(char *sername);
 static void *serial_thread(void *arg);
-static void socket_thread(void);
+static void socket_loop(void);
 
 static void when_sigint(int n)
 {
     printf("Recv SIGINT\n");
     STOP = TRUE;
-    tcsetattr(client_serfd,TCSANOW,&client_oldtio);
-    close(client_sockfd);
-    close(client_serfd);
+    if (client_sockfd > 0) close(client_sockfd);
+    if (client_serfd > 0) close(client_serfd);
     exit(0);
 }
 
@@ -57,6 +57,8 @@ int main(int argc,char *argv[])
     sername = DEFAULT_SERDEVICE;
     if (argc > 2)
         sername = argv[2];
+
+    strcpy(client_sername, sername);
 
 
     if((sockfd = socket(AF_INET,SOCK_STREAM,0)) == -1){
@@ -94,10 +96,12 @@ int main(int argc,char *argv[])
         perror("pthread_create");  
         return -1;
     }
-    socket_thread();
+
+    socket_loop();
 
     exit(0);
 }
+
 
 static int init_serial(char *sername)
 {
@@ -105,7 +109,7 @@ static int init_serial(char *sername)
     struct termios oldtio,newtio;
 
     fd = open(sername, O_RDWR | O_NOCTTY ); 
-    if (fd <0) {perror(sername); return(-1); }
+    if (fd <0) { return(-1); }
 
     tcgetattr(fd,&oldtio); /* save current port settings */
     tcgetattr(fd,&client_oldtio); /* save current port settings */
@@ -130,12 +134,13 @@ static int init_serial(char *sername)
     //tcsetattr(fd,TCSANOW,&oldtio);
 }
 
-static void socket_thread(void)
+static void socket_loop(void)
 {
     unsigned char recv_buf[4096], recbuf[4100];
     int rec_len;
     int num_read, start, end;
     int i;
+    int ret;
 
     rec_len = 0;
     for(;;)
@@ -149,6 +154,10 @@ static void socket_thread(void)
         }
         else if (num_read > 0)
         {
+            if (client_serfd < 0) {
+                client_serfd = init_serial(client_sername);
+            }
+
             printf("Socket Debug: read=%d, left=%d, [0]=%u\n", num_read, rec_len, recv_buf[0]);
             if (num_read+rec_len > 4100)
                 rec_len = 0;
@@ -159,8 +168,15 @@ static void socket_thread(void)
             {
                 if (recbuf[i] == CHAR_HDLC_END)
                 {
-                    if (client_serfd != 0)
-                        write(client_serfd, recbuf+start, end-start+1);
+                    if (client_serfd > 0)
+                    {
+                        ret = write(client_serfd, recbuf+start, end-start+1);
+                        if (ret == -1) {
+                            perror("serial write");
+                            close(client_serfd);
+                            client_serfd = -1;
+                        }
+                    }
                     start = end = i+1;
                     continue;
                 }
@@ -171,6 +187,8 @@ static void socket_thread(void)
                 memmove(recbuf, recbuf+start, rec_len);
         }
     }
+
+    close(client_sockfd);
 }
 
 static void *serial_thread(void *arg)
@@ -184,6 +202,11 @@ static void *serial_thread(void *arg)
     rec_len = 0;
     while (STOP==FALSE) {
 #if 1 /* optimize */
+        if (client_serfd < 0) {
+            sleep(1);
+            continue;
+        }
+
         num_read = read(client_serfd, read_buf, sizeof(read_buf));
         if (num_read > 0)
         {
@@ -208,6 +231,10 @@ static void *serial_thread(void *arg)
             //printf("Debug: start=%d, end=%d, rec_len=%d\n", start, end, rec_len);
             if (rec_len > 0)
                 memmove(recbuf, recbuf+start, rec_len);
+        } else if (num_read == -1) {
+            perror("serial read -1");
+        } else {
+            perror("serial read else");
         }
 #else
         read(client_serfd,&ch,1);
@@ -221,5 +248,8 @@ static void *serial_thread(void *arg)
         }
 #endif
     }
+
+    printf("Exit serial_thread\n");
+    close(client_serfd);
 }
 
